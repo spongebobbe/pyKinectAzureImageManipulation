@@ -8,6 +8,8 @@ class Body:
 
 		if skeleton_handle:
 			self._handle = skeleton_handle
+			self.id = getattr(skeleton_handle, 'id', None)  # Attempt to retrieve the body ID
+			self.skeleton = getattr(skeleton_handle, 'skeleton', None)  # Expose the skeleton
 			self.initialize()
 
 	def json(self):
@@ -32,10 +34,9 @@ class Body:
 
 	def initialize(self):
 		joints = np.ndarray((K4ABT_JOINT_COUNT,),dtype=np.object_)
-
-		for i in range(K4ABT_JOINT_COUNT):
-			joints[i] = Joint(self._handle.skeleton.joints[i], i)
-			
+		if self.skeleton:  # Ensure skeleton exists before accessing joints
+			for i in range(K4ABT_JOINT_COUNT):
+				joints[i] = Joint(self.skeleton.joints[i], i)
 		self.joints = joints
 
 	def __str__(self):
