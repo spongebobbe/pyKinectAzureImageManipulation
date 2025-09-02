@@ -6,8 +6,9 @@ from monai.config import KeysCollection
 from monai.transforms import Compose, Resized, ScaleIntensityRanged, MapTransform
 from scipy.ndimage import label,binary_dilation,binary_erosion,distance_transform_edt,binary_dilation, label, find_objects
 from generative.networks.nets import DiffusionModelUNet
-from generative.networks.schedulers import DDPMScheduler
+from generative.networks.schedulers import DDPMScheduler, DDIMScheduler
 import torch.nn.functional as F
+torch.backends.cudnn.benchmark = True
 
 
 
