@@ -1,18 +1,82 @@
-import numpy as np
-import torch
-import matplotlib.pyplot as plt
-from PIL import Image
-from monai.config import KeysCollection
-from monai.transforms import Compose, Resized, ScaleIntensityRanged, MapTransform
-from scipy.ndimage import label,binary_dilation,binary_erosion,distance_transform_edt,binary_dilation, label, find_objects
-from generative.networks.nets import DiffusionModelUNet
-from generative.networks.schedulers import DDPMScheduler, DDIMScheduler
-import torch.nn.functional as F
-torch.backends.cudnn.benchmark = True
-
-
 
 import json
+import os
+
+import matplotlib.cm as cm
+import matplotlib.colors as colors
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+from PIL import Image
+from generative.networks.nets import AutoencoderKL, DiffusionModelUNet
+from generative.networks.schedulers import DDPMScheduler
+from monai.config import KeysCollection
+from monai.transforms import (Compose, MapTransform, Resized,
+                              ScaleIntensityRanged)
+from scipy.ndimage import (binary_dilation, binary_erosion, distance_transform_edt,
+                           find_objects, label)
+
+torch.backends.cudnn.benchmark = True
+
+def load_autoencoder_from_ckpt(ckpt_path: str, device: torch.device) -> AutoencoderKL:
+    ae = AutoencoderKL(
+        spatial_dims=2,
+        in_channels=1,
+        out_channels=1,
+        num_channels=(64, 128, 256),
+        latent_channels=3,
+        num_res_blocks=1,
+        norm_num_groups=32,
+        attention_levels=(False, False, True),
+    ).to(device)
+    ae.load_state_dict(torch.load(ckpt_path, map_location=device))
+    ae.eval()
+    for p in ae.parameters():
+        p.requires_grad = False
+    return ae
+
+def load_ddpm_from_ckpt(ckpt_path: str, device: torch.device) -> DiffusionModelUNet:
+    model = DiffusionModelUNet(
+        spatial_dims=2,
+        in_channels=3,             # latent channels
+        out_channels=3,
+        num_channels=[64, 128, 128],
+        attention_levels=[False, True, True],
+        num_res_blocks=1,
+        num_head_channels=128,
+    ).to(device)
+    model.load_state_dict(torch.load(ckpt_path, map_location=device))
+    model.eval()
+    return model
+
+def display_image(img, title, cmap='gray', figsize=(5, 5), PrintingEnabled=True):
+    if PrintingEnabled:
+        """
+        Displays an image with the specified title.
+        If the image has a singleton channel dimension (e.g. shape (1, H, W)),
+        it is squeezed to shape (H, W) before displaying.
+        
+        Parameters:
+            img (np.ndarray or torch.Tensor): The image to display.
+            title (str): The title for the displayed image.
+            cmap (str): The colormap to use (default 'gray').
+            figsize (tuple): The figure size.
+        """
+        # If img is a torch tensor, convert it to a numpy array.
+        if hasattr(img, 'cpu'):
+            img = img.cpu().numpy()
+        # If the image has shape (1, H, W), squeeze the channel dimension.
+        if img.ndim == 3 and img.shape[0] == 1:
+            img = np.squeeze(img, axis=0)
+        
+        plt.figure(figsize=figsize)
+        plt.imshow(img, cmap=cmap)
+        plt.title(title)
+        plt.axis("off")
+        plt.show(block=False)
+
 
 def array_to_tensor(image_pixels):
     """
@@ -29,36 +93,48 @@ def array_to_tensor(image_pixels):
     image_tensor = torch.tensor(image_pixels, dtype=torch.float32)
     return image_tensor
 
-class CleanBackgroundTrh(MapTransform):
-    def __init__(self, keys):
-        super().__init__(keys)
+def tensor_to_array(tensor):
+    arr = tensor.cpu().numpy()
+    if arr.shape[0] == 1:
+        arr = np.squeeze(arr, axis=0)
+    return arr
 
-    def __call__(self, data):
-        for key in self.keys:
-            img = data[key]
-            img_np = img.cpu().numpy()
-            img_np = np.where(img_np > 4000, 0, img_np)
-            img_np = np.where(img_np < 1000, 0, img_np)
-            data[key] = torch.tensor(img_np, device=img.device)
-        return data
+def make_json_serializable(item):
+    if hasattr(item, 'detach'):  # covers torch.Tensor and similar types
+        if item.ndim == 0:
+            return item.item()
+        return item.detach().cpu().tolist()
+    elif isinstance(item, dict):
+        return {k: make_json_serializable(v) for k, v in item.items()}
+    elif isinstance(item, list):
+        return [make_json_serializable(i) for i in item]
+    return item
+
+def rgbcomparison(base_image, binary_mask):
+    """
+    Creates an RGB image with:
+        - The red channel as the binary mask (scaled to 0-255),
+        - The green channel as the base image,
+        - The blue channel as zeros.
     
-
-class ZeroOutRowsTransform(MapTransform):
-    def __init__(self, keys):
-        super().__init__(keys)
-
-    def __call__(self, data):
-        for key in self.keys:
-            img = data[key]
-            img = img.permute(1, 2, 0)
-            img_np = img.cpu().numpy()
-            rows_sums = np.squeeze(img_np.sum(axis=1))
-            img_np[:np.argmin(rows_sums) + 10, :, :] = 0
-            img = torch.tensor(img_np, device=data[key].device)
-            img = img.permute(2, 0, 1)
-            data[key] = img
-        return data
-
+    Parameters:
+        base_image (np.ndarray): The input image array (assumed to be in [0,1] or [0,255]).
+        binary_mask (np.ndarray): The binary mask (with values 0 or 1).
+    
+    Returns:
+        np.ndarray: The resulting RGB image as a uint8 array.
+    """
+    if base_image.max() <= 1:
+        base_uint8 = (base_image * 255).astype(np.uint8)
+    else:
+        base_uint8 = base_image.astype(np.uint8)
+    if binary_mask.max() <= 1:
+        mask_uint8 = (binary_mask * 255).astype(np.uint8)
+    else:
+        mask_uint8 = binary_mask.astype(np.uint8)
+    blue = np.zeros_like(base_uint8, dtype=np.uint8)
+    rgb = np.stack([mask_uint8, base_uint8, blue], axis=-1)
+    return rgb
 
 class RemoveSmallObjectsTransform(MapTransform):
     def __init__(self, keys, min_size=9):
@@ -77,62 +153,8 @@ class RemoveSmallObjectsTransform(MapTransform):
                 channel_img[small_objects_mask] = 0
                 img_np[c] = channel_img
             data[key] = torch.tensor(img_np, device=img.device)
-        return data
+        return data  
 
-
-class ZeroOutColumnsTransform(MapTransform):
-    def __init__(self, keys):
-        super().__init__(keys)
-
-    def __call__(self, data):
-        for key in self.keys:
-            img = data[key]
-            img = img.permute(1, 2, 0)
-            img_np = img.cpu().numpy()
-            height = img_np.shape[0]
-            top_2_3_rows = img_np[:int(2 * height / 3), :, :]
-            non_zero_mask = top_2_3_rows.sum(axis=2).sum(axis=0) > 0
-            non_zero_cols = np.nonzero(non_zero_mask)[0]
-            if len(non_zero_cols) > 0:
-                min_col = non_zero_cols[0]
-                max_col = non_zero_cols[-1]
-                img_np[:, :min_col, :] = 0
-                img_np[:, max_col + 1:, :] = 0
-            img = torch.tensor(img_np, device=data[key].device)
-            img = img.permute(2, 0, 1)
-            data[key] = img
-        return data
-    
-
-class GrayscaleZScoreTransform(MapTransform):
-    def __init__(self, keys: KeysCollection):
-        super().__init__(keys)
-
-    def __call__(self, data):
-        for key in self.keys:
-            img = data[key]
-            if img.shape[0] == 3:
-                weights = torch.tensor([0.2989, 0.5870, 0.1140],
-                                       device=img.device).view(3, 1, 1)
-                grayscale = (img * weights).sum(0, keepdim=True)
-            elif img.shape[0] == 1:
-                grayscale = img
-            else:
-                raise ValueError(f"Unexpected number of channels: {img.shape[0]}")
-            non_zero_values = grayscale[grayscale != 0]
-            if non_zero_values.numel() > 0:
-                mean = non_zero_values.mean()
-                std = non_zero_values.std()
-            else:
-                mean = torch.tensor(0.0, device=grayscale.device)
-                std = torch.tensor(1.0, device=grayscale.device)
-            z_score_img = (grayscale - mean) / std
-            data[key] = z_score_img
-            reversible_info = data.get("reversible_info", {})
-            reversible_info["zscore"] = {"mean": mean.item(), "std": std.item()}
-            data["reversible_info"] = reversible_info
-        return data
-    
 class CropROI(MapTransform):
     def __init__(self, keys):
         super().__init__(keys)
@@ -172,13 +194,137 @@ class CropROI(MapTransform):
                 "cropped_shape": list(cropped_img.shape),
             }
             data["reversible_info"] = reversible_info
+        return data  
+
+class GrayscaleZScoreTransform(MapTransform):
+    def __init__(self, keys: KeysCollection):
+        super().__init__(keys)
+
+    def __call__(self, data):
+        for key in self.keys:
+            img = data[key]
+            if img.shape[0] == 3:
+                weights = torch.tensor([0.2989, 0.5870, 0.1140],
+                                       device=img.device).view(3, 1, 1)
+                grayscale = (img * weights).sum(0, keepdim=True)
+            elif img.shape[0] == 1:
+                grayscale = img
+            else:
+                raise ValueError(f"Unexpected number of channels: {img.shape[0]}")
+            non_zero_values = grayscale[grayscale != 0]
+            if non_zero_values.numel() > 0:
+                mean = non_zero_values.mean()
+                std = non_zero_values.std()
+            else:
+                mean = torch.tensor(0.0, device=grayscale.device)
+                std = torch.tensor(1.0, device=grayscale.device)
+            z_score_img = (grayscale - mean) / std
+            data[key] = z_score_img
+            reversible_info = data.get("reversible_info", {})
+            reversible_info["zscore"] = {"mean": mean.item(), "std": std.item()}
+            data["reversible_info"] = reversible_info
         return data
 
-def tensor_to_array(tensor):
-    arr = tensor.cpu().numpy()
-    if arr.shape[0] == 1:
-        arr = np.squeeze(arr, axis=0)
-    return arr 
+class ZeroOutColumnsTransform(MapTransform):
+    def __init__(self, keys):
+        super().__init__(keys)
+
+    def __call__(self, data):
+        for key in self.keys:
+            img = data[key]
+            img = img.permute(1, 2, 0)
+            img_np = img.cpu().numpy()
+            height = img_np.shape[0]
+            top_2_3_rows = img_np[:int(2 * height / 3), :, :]
+            non_zero_mask = top_2_3_rows.sum(axis=2).sum(axis=0) > 0
+            non_zero_cols = np.nonzero(non_zero_mask)[0]
+            if len(non_zero_cols) > 0:
+                min_col = non_zero_cols[0]
+                max_col = non_zero_cols[-1]
+                img_np[:, :min_col, :] = 0
+                img_np[:, max_col + 1:, :] = 0
+            img = torch.tensor(img_np, device=data[key].device)
+            img = img.permute(2, 0, 1)
+            data[key] = img
+        return data
+
+class ZeroOutRowsTransform(MapTransform):
+    def __init__(self, keys):
+        super().__init__(keys)
+
+    def __call__(self, data):
+        for key in self.keys:
+            img = data[key]
+            img = img.permute(1, 2, 0)
+            img_np = img.cpu().numpy()
+            rows_sums = np.squeeze(img_np.sum(axis=1))
+            img_np[:np.argmin(rows_sums) + 10, :, :] = 0
+            img = torch.tensor(img_np, device=data[key].device)
+            img = img.permute(2, 0, 1)
+            data[key] = img
+        return data
+    
+class CleanBackgroundTrh(MapTransform):
+    def __init__(self, keys):
+        super().__init__(keys)
+
+    def __call__(self, data):
+        for key in self.keys:
+            img = data[key]
+            img_np = img.cpu().numpy()
+            img_np = np.where(img_np > 4000, 0, img_np)
+            img_np = np.where(img_np < 1000, 0, img_np)
+            data[key] = torch.tensor(img_np, device=img.device)
+        return data
+
+class CropIRByReversibleInfo(MapTransform):
+    def __init__(self, keys, info_key="reversible_info"):
+        super().__init__(keys)
+        self.info_key = info_key
+
+    def __call__(self, data):
+        # Expect data to have both "ir_image" and "reversible_info" keys.
+        ir_img = data["ir_image"]
+        rev_info = data.get(self.info_key, {})
+        crop_info = rev_info.get("crop_roi", {})
+        start_x = int(crop_info.get("start_x", 0))
+        start_y = int(crop_info.get("start_y", 0))
+        end_x = int(crop_info.get("end_x", 0))
+        end_y = int(crop_info.get("end_y", 0))
+        cropped_ir = ir_img[:, start_y:end_y, start_x:end_x]
+        data["ir_image"] = cropped_ir
+        return data
+def mask_img_to_latent(mask_tensor_img, latent_h, latent_w):
+    """
+    mask_tensor_img: (1,1,H,W) float {0,1}
+    returns: (1,3,latent_h,latent_w) broadcast to 3 channels
+    """
+    m = F.interpolate(mask_tensor_img, size=(latent_h, latent_w), mode="nearest")
+    m3 = m.repeat(1, 3, 1, 1)
+    return m3
+
+def process_ir_image(ir_tensor, reversible_info):
+    """
+    Process an IR image tensor using a Compose pipeline that:
+      - Crops the IR image using the ROI coordinates stored in reversible_info,
+      - Resizes the resulting crop to 256x256.
+    
+    Parameters:
+        ir_tensor (torch.Tensor): The IR image tensor in channel-first format (1, H, W).
+        reversible_info (dict): The reversible transformation information (from depth preprocessing).
+    
+    Returns:
+        ir_roi_array (np.ndarray): The processed IR ROI as a NumPy array.
+    """
+    data = {"ir_image": ir_tensor, "reversible_info": reversible_info}
+    pipeline = Compose([
+        CropIRByReversibleInfo(keys=["ir_image"], info_key="reversible_info"),
+        Resized(keys=["ir_image"], spatial_size=(256, 256))
+    ])
+    sample = pipeline(data)
+    ir_roi_tensor = sample["ir_image"]
+    ir_roi_array = tensor_to_array(ir_roi_tensor)
+    return ir_roi_array
 
 def preprocessing_live(image_tensor):
     """
@@ -226,47 +372,6 @@ def preprocessing_live(image_tensor):
     reversible_info = sample.get("reversible_info", {})
     
     return roi_array, reversible_info
-
-
-def display_image(img, title, cmap='gray', figsize=(5, 5)):
-        if False:
-
-            """
-            Displays an image with the specified title.
-            If the image has a singleton channel dimension (e.g. shape (1, H, W)),
-            it is squeezed to shape (H, W) before displaying.
-            
-            Parameters:
-                img (np.ndarray or torch.Tensor): The image to display.
-                title (str): The title for the displayed image.
-                cmap (str): The colormap to use (default 'gray').
-                figsize (tuple): The figure size.
-            """
-            # If img is a torch tensor, convert it to a numpy array.
-            if hasattr(img, 'cpu'):
-                img = img.cpu().numpy()
-            # If the image has shape (1, H, W), squeeze the channel dimension.
-            if img.ndim == 3 and img.shape[0] == 1:
-                img = np.squeeze(img, axis=0)
-            
-            plt.figure(figsize=figsize)
-            plt.imshow(img, cmap=cmap)
-            plt.title(title)
-            plt.axis("off")
-            plt.show(block=True)
-
-
-def make_json_serializable(item):
-    if hasattr(item, 'detach'):  # covers torch.Tensor and similar types
-        if item.ndim == 0:
-            return item.item()
-        return item.detach().cpu().tolist()
-    elif isinstance(item, dict):
-        return {k: make_json_serializable(v) for k, v in item.items()}
-    elif isinstance(item, list):
-        return [make_json_serializable(i) for i in item]
-    return item
-
 
 def clean_image(roi_array, reversible_info):
     """
@@ -327,49 +432,6 @@ def clean_image(roi_array, reversible_info):
     
     return reconstructed_clipped
 
-
-def preprocess_ir_image(ir_tensor, reversible_info):
-    """
-    Process an IR image tensor using a Compose pipeline that:
-      - Crops the IR image using the ROI coordinates stored in reversible_info,
-      - Resizes the resulting crop to 256x256.
-    
-    Parameters:
-        ir_tensor (torch.Tensor): The IR image tensor in channel-first format (1, H, W).
-        reversible_info (dict): The reversible transformation information (from depth preprocessing).
-    
-    Returns:
-        ir_roi_array (np.ndarray): The processed IR ROI as a NumPy array.
-    """
-    data = {"ir_image": ir_tensor, "reversible_info": reversible_info}
-    pipeline = Compose([
-        CropIRByReversibleInfo(keys=["ir_image"], info_key="reversible_info"),
-        Resized(keys=["ir_image"], spatial_size=(256, 256))
-    ])
-    sample = pipeline(data)
-    ir_roi_tensor = sample["ir_image"]
-    ir_roi_array = tensor_to_array(ir_roi_tensor)
-    return ir_roi_array
-
-class CropIRByReversibleInfo(MapTransform):
-    def __init__(self, keys, info_key="reversible_info"):
-        super().__init__(keys)
-        self.info_key = info_key
-
-    def __call__(self, data):
-        # Expect data to have both "ir_image" and "reversible_info" keys.
-        ir_img = data["ir_image"]
-        rev_info = data.get(self.info_key, {})
-        crop_info = rev_info.get("crop_roi", {})
-        start_x = int(crop_info.get("start_x", 0))
-        start_y = int(crop_info.get("start_y", 0))
-        end_x = int(crop_info.get("end_x", 0))
-        end_y = int(crop_info.get("end_y", 0))
-        cropped_ir = ir_img[:, start_y:end_y, start_x:end_x]
-        data["ir_image"] = cropped_ir
-        return data
-
-
 def create_binary_mask(image_array, lower_percentile=0, upper_percentile=99):
     """
     Creates a binary mask from an image array such that all nonzero pixels
@@ -393,6 +455,79 @@ def create_binary_mask(image_array, lower_percentile=0, upper_percentile=99):
     
     binary_mask = np.where((image_array >= lower_threshold) & (image_array < upper_threshold), 1, 0).astype(np.uint8)
     return binary_mask
+
+def detect_blobs(binary_mask):
+    """
+    Performs blob detection on a binary mask by labeling connected components.
+
+    Parameters:
+        binary_mask (np.ndarray): A binary mask (with values 0 and 1).
+
+    Returns:
+        labeled_mask (np.ndarray): An array with the same shape as binary_mask, where each connected component
+                                   (blob) is assigned a unique label (0 is the background).
+        num_blobs (int): The number of detected blobs.
+        blob_slices (list of slice tuples): A list of slice objects corresponding to the bounding box of each blob.
+    """
+    # Label connected components in the binary mask.
+    labeled_mask, num_blobs = label(binary_mask)
+    
+    # Optionally, use find_objects to get slices (bounding boxes) for each blob.
+    blob_slices = find_objects(labeled_mask)
+    
+    return labeled_mask, num_blobs, blob_slices
+
+def create_color_labeled_image(labeled_mask):
+    """
+    Creates a color image from a labeled mask.
+    Each unique label (except 0) is mapped to a distinct color using a colormap.
+    Background (label 0) is set to black.
+    
+    Parameters:
+        labeled_mask (np.ndarray): A 2D array with labels (0 is background).
+    
+    Returns:
+        np.ndarray: A color (RGB) image as a uint8 array.
+    """
+    # Get the number of labels; we add one so that label values map correctly.
+    num_labels = np.max(labeled_mask) + 1
+    # Create a colormap (we use HSV so that hues vary).
+    cmap = cm.get_cmap('hsv', num_labels)
+    
+    # Normalize the labels to the range [0, 1] for the colormap.
+    norm = colors.Normalize(vmin=0, vmax=num_labels-1)
+    
+    # Map each label to its corresponding color.
+    colored = cmap(norm(labeled_mask))
+    # colored is an MxNx4 array (RGBA) in float; set background (label 0) to black:
+    colored[labeled_mask == 0] = [0, 0, 0, 1]
+    # Convert to uint8 and drop the alpha channel.
+    rgb_image = (colored[..., :3] * 255).astype(np.uint8)
+    return rgb_image
+def expand_blob_perimeter(binary_mask, n_steps=1):
+    """
+    Expands only the perimeter of the blobs in a binary mask.
+
+    Parameters:
+        binary_mask (np.ndarray): Input binary mask (0s and 1s).
+        n_steps (int): Number of dilation iterations to expand the perimeter.
+
+    Returns:
+        np.ndarray: Updated binary mask with the expanded blob perimeters.
+    """
+    # Step 1: Extract the perimeter of the blobs.
+    # Erode the mask so that the boundaries shrink.
+    eroded_mask = binary_erosion(binary_mask)
+    # The difference between the original mask and its erosion is the perimeter.
+    blob_perimeter = binary_mask & (~eroded_mask)
+    
+    # Step 2: Dilate only the perimeter.
+    expanded_perimeter = binary_dilation(blob_perimeter, iterations=n_steps)
+    
+    # Step 3: Combine the dilated perimeter with the original mask.
+    updated_mask = binary_mask | expanded_perimeter
+    
+    return updated_mask.astype(np.uint8)
 
 def expand_blobs_with_conditions(binary_mask, binary_mask2, roi_with_holes1, num_iterations):
     """
@@ -453,202 +588,120 @@ def expand_blobs_with_conditions(binary_mask, binary_mask2, roi_with_holes1, num
     
     return binary_mask
 
-
-def rgbcomparison(base_image, binary_mask):
-    """
-    Creates an RGB image with:
-        - The red channel as the binary mask (scaled to 0-255),
-        - The green channel as the base image,
-        - The blue channel as zeros.
-    
-    Parameters:
-        base_image (np.ndarray): The input image array (assumed to be in [0,1] or [0,255]).
-        binary_mask (np.ndarray): The binary mask (with values 0 or 1).
-    
-    Returns:
-        np.ndarray: The resulting RGB image as a uint8 array.
-    """
-    if base_image.max() <= 1:
-        base_uint8 = (base_image * 255).astype(np.uint8)
-    else:
-        base_uint8 = base_image.astype(np.uint8)
-    if binary_mask.max() <= 1:
-        mask_uint8 = (binary_mask * 255).astype(np.uint8)
-    else:
-        mask_uint8 = binary_mask.astype(np.uint8)
-    blue = np.zeros_like(base_uint8, dtype=np.uint8)
-    rgb = np.stack([mask_uint8, base_uint8, blue], axis=-1)
-    return rgb
-
-
-def detect_blobs(binary_mask):
-    """
-    Performs blob detection on a binary mask by labeling connected components.
-
-    Parameters:
-        binary_mask (np.ndarray): A binary mask (with values 0 and 1).
-
-    Returns:
-        labeled_mask (np.ndarray): An array with the same shape as binary_mask, where each connected component
-                                (blob) is assigned a unique label (0 is the background).
-        num_blobs (int): The number of detected blobs.
-        blob_slices (list of slice tuples): A list of slice objects corresponding to the bounding box of each blob.
-    """
-    # Label connected components in the binary mask.
-    labeled_mask, num_blobs = label(binary_mask)
-    
-    # Optionally, use find_objects to get slices (bounding boxes) for each blob.
-    blob_slices = find_objects(labeled_mask)
-    
-    return labeled_mask, num_blobs, blob_slices
-
-
-def inpaint_single_image(image_array, mask_array, config_path, model_path, num_inference_steps=None, num_resample_steps=1, device=None):
-    """
-    Loads the configuration and model, resizes the input image and mask according to the spatial dimensions
-    specified in the configuration, then performs inpainting on the image using the provided mask.
-    The inpainting is carried out based on the known (unmasked) and unknown (masked) regions without further preprocessing.
-    Inference is performed under torch.no_grad(). The final output is resized back to the original input image size,
-    and the known pixels from the original (non-resized) image are substituted back into the result.
-    
-    Parameters:
-        image_array (np.ndarray): Input image array (ROI) to be inpainted.
-            Expected shape: (H, W) or (C, H, W) where C is typically 1.
-        mask_array (np.ndarray): Binary mask array to guide the inpainting.
-            Expected shape: (H, W) or (C, H, W) matching the image spatial dimensions.
-        config_path (str): Path to the JSON configuration file.
-        model_path (str): Path to the model weights file.
-        num_inference_steps (int, optional): Number of timesteps for inference. If None, it will be taken from the config.
-        num_resample_steps (int, optional): Number of resampling steps per timestep (default: 1).
-        device (torch.device, optional): Device to run inference on. Defaults to CUDA if available, else CPU.
-    
-    Returns:
-        np.ndarray: The inpainted image as a NumPy array (converted to channel-last format)
-                    resized back to the original input image size, with known pixels substituted from the original image.
-    """
+def inpaint_single_image(image_array,
+                         mask_array,
+                         ae: AutoencoderKL,
+                         model: DiffusionModelUNet,
+                         num_inference_steps: int = 1000,
+                         num_resample_steps: int = 1,
+                         n_resamples: int = 3,
+                         device: torch.device = None):
+    print(f"inpainting on device: {device} | n_resamples={n_resamples}")
 
     display_image(image_array, "Original Image")
-    # Invert the binary mask (so that 1 corresponds to known pixels)
-    mask_array = np.logical_not(mask_array)
-    display_image(mask_array, "Inverted Mask")
-    
-    # Set device if not provided
+
+    # mask_array expected: 1 where masked in your pipeline -> invert to 1 = KNOWN
+    mask_array = np.logical_not(mask_array).astype(np.uint8)
+    display_image(mask_array, "Inverted Mask (1 = known)")
+
     if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    # Load configuration
-    with open(config_path, 'r') as f:
-        config = json.load(f)
-        # print("Configuration:")
-        # print(json.dumps(config, indent=4))
-    
-    # Set default number of inference steps if not provided
-    if num_inference_steps is None:
-        num_inference_steps = config.get("scheduler_steps", 200)
-    
-    # Load the model
-    model = DiffusionModelUNet(
-        spatial_dims=config["spatial_dims"],
-        in_channels=config["in_channels"],
-        out_channels=config["out_channels"],
-        num_channels=config["model_channels"],
-        attention_levels=config["attention_levels"],
-        num_res_blocks=config["num_res_blocks"],
-        num_head_channels=config["num_head_channels"]
-    ).to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
-    model.eval()
-    
-    # Create scheduler and set timesteps
-    scheduler = DDPMScheduler(num_train_timesteps=num_inference_steps)
-    scheduler.set_timesteps(num_inference_steps)
-    # print("Number of inference steps:", num_inference_steps)
-    
-    # Convert image_array to a torch tensor with shape (1, C, H, W)
+        device = next(model.parameters()).device
+
+    # Prepare tensors WITHOUT resizing
     if image_array.ndim == 2:
-        image_tensor = torch.tensor(image_array, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+        image_tensor = torch.tensor(image_array, dtype=torch.float32).unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
     elif image_array.ndim == 3:
-        image_tensor = torch.tensor(image_array, dtype=torch.float32).unsqueeze(0)
+        image_tensor = torch.tensor(image_array, dtype=torch.float32).unsqueeze(0)               # (1,C,H,W)
     else:
-        raise ValueError("Unsupported image_array shape. Expected a 2D or 3D array.")
-    
-    # Store original spatial size (H, W) for later restoration
-    original_size = image_tensor.shape[-2:]
-    
-    # Convert mask_array to a torch tensor with shape (1, C, H, W)
-    if mask_array is None:
-        raise ValueError("mask_array must be provided.")
+        raise ValueError("Unsupported image_array shape. Expected 2D or 3D.")
+
     if mask_array.ndim == 2:
-        mask_tensor = torch.tensor(mask_array, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+        mask_tensor = torch.tensor(mask_array, dtype=torch.float32).unsqueeze(0).unsqueeze(0)    # (1,1,H,W)
     elif mask_array.ndim == 3:
         mask_tensor = torch.tensor(mask_array, dtype=torch.float32).unsqueeze(0)
     else:
-        raise ValueError("Unsupported mask_array shape. Expected a 2D or 3D array.")
-    
-    # Resize the image and mask according to the spatial dimensions specified in the config
-    spatial_size = config.get("spatial_size")
-    if spatial_size is not None:
-        image_tensor_resized = F.interpolate(image_tensor, size=spatial_size, mode='bilinear', align_corners=False)
-        mask_tensor_resized = F.interpolate(mask_tensor, size=spatial_size, mode='nearest')
-    else:
-        image_tensor_resized = image_tensor
-        mask_tensor_resized = mask_tensor
-    
-    # (Optional) Display resized image and mask
-    display_image(image_tensor_resized.squeeze(0), "Resized Image")
-    display_image(mask_tensor_resized.squeeze(0), "Resized Mask")
-    # print("Resized image and mask shapes:")
-    # print(image_tensor_resized.shape)
-    # print(mask_tensor_resized.shape)
-    
-    # Move tensors to the correct device
-    image_tensor_resized = image_tensor_resized.to(device)
-    mask_tensor_resized = mask_tensor_resized.to(device)
-    
-    # Prepare the masked image and initialize the inpainted image with random noise
-    masked_image = image_tensor_resized * mask_tensor_resized
-    inpainted_image = torch.randn_like(masked_image).to(device)
-    
-    # Perform inpainting inference without gradient computation
+        raise ValueError("Unsupported mask_array shape. Expected 2D or 3D.")
+
+    original_size = image_tensor.shape[-2:]
+    image_tensor = image_tensor.to(device)
+    mask_tensor  = mask_tensor.to(device)
+
+    # Encode once
     with torch.no_grad():
-        for t in scheduler.timesteps:
-            for _ in range(num_resample_steps):
-                noise = torch.randn_like(inpainted_image).to(device)
-                if t > 0:
-                    known_part = scheduler.add_noise(
-                        original_samples=masked_image, noise=noise, timesteps=(t - 1)
-                    )
-                    t_tensor = torch.full((inpainted_image.size(0),), t, device=device, dtype=torch.long)
-                    model_output = model(inpainted_image, timesteps=t_tensor)
-                    unknown_part, _ = scheduler.step(model_output, t, inpainted_image)
-                    # Combine known (unmasked) and unknown (masked) regions
-                    inpainted_image = torch.where(mask_tensor_resized == 1, known_part, unknown_part)
-    
-    # Clip the final image to [0, 1] and ensure known pixels remain unchanged in the resized domain
-    inpainted_image = torch.clamp(inpainted_image, 0, 1)
-    inpainted_image = torch.where(mask_tensor_resized == 1, image_tensor_resized, inpainted_image)
-    
-    # Remove the batch dimension from the inpainted image
-    result = inpainted_image.cpu().squeeze(0)
-    display_image(result, "Inpainted Image low res")
+        z, _ = ae.encode(image_tensor)      # (1,3,H_l,W_l)
 
-    # Resize the result back to the original input image size
-    result = F.interpolate(result.unsqueeze(0), size=original_size, mode='bilinear', align_corners=False).squeeze(0)
-    display_image(result, "original dimensions Inpainted Image")
-    result = result.numpy()
-    
-    # Substitute the known pixels from the original image back into the result
-    result = np.where(result <= np.percentile(result[result > 0], 25), 0, result)
-    result = np.where(mask_array, image_array, result)
-    
-    # Convert result from channel-first (C, H, W) to channel-last (H, W, C) format:
-    if result.ndim == 3:
-        if result.shape[0] == 1:
-            # For single channel images, remove the channel dimension
-            result = result[0]
+    H_l, W_l = z.shape[-2], z.shape[-1]
+    mask_latent = mask_img_to_latent(mask_tensor, H_l, W_l)  # (1,3,H_l,W_l), 1 = known
+
+    # Prepare scheduler (we'll reset timesteps each resample for safety)
+    scheduler = DDPMScheduler(num_train_timesteps=max(1000, int(num_inference_steps)))
+
+    decoded_accum = None
+
+    for r in range(int(n_resamples)):
+        # Fresh noise run
+        scheduler.set_timesteps(int(num_inference_steps))
+        known_lat = z * mask_latent
+        x = torch.randn_like(known_lat)
+
+        with torch.no_grad():
+            for t in scheduler.timesteps:
+                for _ in range(num_resample_steps):
+                    if t > 0:
+                        noise = torch.randn_like(x)
+                        known_noised = scheduler.add_noise(known_lat, noise=noise, timesteps=(t - 1))
+                        t_vec = torch.full((x.size(0),), t, device=device, dtype=torch.long)
+                        pred = model(x, timesteps=t_vec)
+                        step_out = scheduler.step(pred, t, x)
+                        x_prev = step_out[0] if isinstance(step_out, (tuple, list)) else step_out.prev_sample
+                        x = torch.where(mask_latent == 1, known_noised, x_prev)
+
+        # Ensure known latents are exact
+        x = torch.where(mask_latent == 1, z, x)
+
+        # Decode this resample
+        with torch.no_grad():
+            decoded = ae.decode(x)          # (1,1,H,W)
+        decoded = torch.clamp(decoded, 0, 1)
+
+        # Accumulate
+        if decoded_accum is None:
+            decoded_accum = decoded.float()
         else:
-            # For multi-channel images, transpose the dimensions
-            result = np.transpose(result, (1, 2, 0))
-    
-    return result
+            decoded_accum = decoded_accum + decoded.float()
 
+    # Mean over resamples
+    decoded_mean = decoded_accum / float(n_resamples)
+    print("Decoded mean shape:", decoded_mean.shape)
+    display_image(decoded_mean.squeeze(0), f"Inpainted mean of {n_resamples} resamples")
+
+    # To numpy
+    result = decoded_mean.cpu().squeeze(0).numpy()
+
+    # Compose: keep known pixels from original (no thresholding)
+    if result.ndim == 3 and result.shape[0] == 1:
+        result2d = result[0]
+    elif result.ndim == 2:
+        result2d = result
+    else:
+        raise ValueError("Unexpected decoded shape; expected (1,H,W) or (H,W).")
+
+    if image_array.ndim == 3 and image_array.shape[0] == 1:
+        img2d = image_array[0]
+    elif image_array.ndim == 2:
+        img2d = image_array
+    else:
+        raise ValueError("Unexpected image_array shape; expected (H,W) or (1,H,W).")
+
+    if mask_array.ndim == 3 and mask_array.shape[0] == 1:
+        m2d = mask_array[0]
+    elif mask_array.ndim == 2:
+        m2d = mask_array
+    else:
+        raise ValueError("Unexpected mask_array shape; expected (H,W) or (1,H,W).")
+
+    # m2d == 1 -> known pixels from original
+    result = np.where(m2d, img2d, result2d)
+    result = np.clip(result, 0, 1)
+
+    return result

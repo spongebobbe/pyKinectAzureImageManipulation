@@ -10,7 +10,7 @@ import sys
 from examples.utils.azureKinectFileUtils import makeC3d
 from examples.utils.inpaintingUtils import inpaint_blobs_IR, inpaint_blobs_depth, visualize_ir_before_after
 from examples.utils.azureKinectFileUtils import BONE_LIST, extract_skeleton_data, makeC3d 
-from examples.utils.inpaintingDLUtils import array_to_tensor, clean_image, create_binary_mask, display_image, expand_blobs_with_conditions, inpaint_single_image, preprocess_ir_image, preprocessing_live 
+from examples.utils.inpaintingDLUtils import array_to_tensor, clean_image, create_binary_mask, display_image, expand_blobs_with_conditions, inpaint_single_image, preprocess_ir_image, preprocessing_live # mie
 
 from pykinect_azure.k4arecord.playback import Playback
 from scipy.ndimage import binary_erosion
