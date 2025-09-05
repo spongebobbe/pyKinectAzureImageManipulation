@@ -10,7 +10,25 @@ import sys
 from examples.utils.azureKinectFileUtils import makeC3d
 from examples.utils.inpaintingUtils import inpaint_blobs_IR, inpaint_blobs_depth, visualize_ir_before_after
 from examples.utils.azureKinectFileUtils import BONE_LIST, extract_skeleton_data, makeC3d 
-from examples.utils.inpaintingDLUtils import array_to_tensor, clean_image, create_binary_mask, display_image, expand_blobs_with_conditions, inpaint_single_image, preprocess_ir_image, preprocessing_live # mie
+from examples.utils.inpaintingDLUtils import (
+	array_to_tensor,
+	clean_image,
+	create_binary_mask,
+	create_color_labeled_image,
+	detect_blobs,
+	display_image,
+	expand_blob_perimeter,
+	expand_blobs_with_conditions,
+	inpaint_single_image,
+	load_autoencoder_from_ckpt,
+	load_ddpm_from_ckpt,
+	make_json_serializable,
+	mask_img_to_latent,
+	preprocessing_live,
+	process_ir_image,
+	rgbcomparison
+)
+
 
 from pykinect_azure.k4arecord.playback import Playback
 from scipy.ndimage import binary_erosion
@@ -43,13 +61,28 @@ if __name__ == "__main__":
 	pykinect.initialize_libraries(track_body=True)
 
 	
-	run_dir=r"D:\mkv_recordings\VICON KINECT\federico_model\run_2024_12_09_at_13_54_33"
-	run_name=r"run_2024_12_09_at_13_54_33"
-	model_folder=r"D:\mkv_recordings\VICON KINECT\federico_model\run_2024_12_09_at_13_54_33\best_model_saved"
-	model_name=r"run_2024_12_09_at_13_54_33_best_model_epoch_480.pth"
+	# run_dir=r"D:\mkv_recordings\VICON KINECT\federico_model\run_2024_12_09_at_13_54_33"
+	# run_name=r"run_2024_12_09_at_13_54_33"
+	# model_folder=r"D:\mkv_recordings\VICON KINECT\federico_model\run_2024_12_09_at_13_54_33\best_model_saved"
+	# model_name=r"run_2024_12_09_at_13_54_33_best_model_epoch_480.pth"
 
-	config_path = os.path.join(run_dir, "best_model_parameters", f"{run_name}_config.json")
-	model_path = os.path.join(model_folder, model_name)
+
+	################
+	n_resampling  = 3
+	n_inference   = 200
+
+	device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+	print(f"Using device: {device}")
+	AE_CKPT  = r"C:\Users\Feder\sources\kinect_thesis\autoencoder_training_run_2025_05_09_at_19_41_45_810_FFT\best_autoencoder_saved\autoencoder_training_run_2025_05_09_at_19_41_45_810_FFT_best_model_epoch_205.pth"
+	DDPM_CKPT = r"C:\Users\Feder\sources\kinect_thesis\diffusion_training_run_2025_05_18_at_19_03_00_550_autoencoder\best_model\diffusion_training_run_2025_05_18_at_19_03_00_550_autoencoder_best_epoch_535.pth"
+	ae  = load_autoencoder_from_ckpt(AE_CKPT, device)
+	ddpm = load_ddpm_from_ckpt(DDPM_CKPT, device)
+	print("Models loaded.")
+
+
+
+	# config_path = os.path.join(run_dir, "best_model_parameters", f"{run_name}_config.json")
+	# model_path = os.path.join(model_folder, model_name)
 
 	for video_filename in mkv_paths:
 		video_filename = os.path.abspath(video_filename)
@@ -94,14 +127,14 @@ if __name__ == "__main__":
 					#print("Reversible Transformation Info:")
 					#print(json.dumps(make_json_serializable(rev_info), indent=4))
 					#----------------------------------
-					reconstructed_image = clean_image(roi_array, rev_info)
-					print("Reconstructed Image (Depth)")
-					print(reconstructed_image.shape)
-					display_image(reconstructed_image, "Reconstructed Image (Depth)")
+					# reconstructed_image = clean_image(roi_array, rev_info)
+					# print("Reconstructed Image (Depth)")
+					# print(reconstructed_image.shape)
+					# display_image(reconstructed_image, "Reconstructed Image (Depth)")
 					#----------------------------------
 					ret_ir, IR_image = capture.get_ir_image()
 					ir_tensor = array_to_tensor(IR_image)
-					ir_roi_array = preprocess_ir_image(ir_tensor, rev_info)
+					ir_roi_array = process_ir_image(ir_tensor, rev_info)
 					display_image(ir_roi_array, "Processed IR ROI")
 					#----------------------------------
 					# Create a binary mask from the IR ROI.
@@ -121,7 +154,17 @@ if __name__ == "__main__":
 
 					
 					start = time.time()				
-					inpainted_image = inpaint_single_image(roi_array, binary_mask3, config_path, model_path, num_inference_steps=200, num_resample_steps=1)
+					#inpainted_image = inpaint_single_image(roi_array, binary_mask3, config_path, model_path, num_inference_steps=200, num_resample_steps=1)
+					inpainted_image = inpaint_single_image(
+						roi_array,
+						binary_mask3,
+						ae=ae,
+						model=ddpm,
+						num_inference_steps=n_inference,
+						num_resample_steps=n_resampling,
+						device=device,
+					)
+
 					elapsed = time.time() - start
 					print(f"[Timing] Inpainting took {elapsed:.2f} seconds")
 					display_image(inpainted_image, "Inpainted Image (Depth)")
